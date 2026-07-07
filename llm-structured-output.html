@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>如何确保 LLM 返回的 JSON 严格符合预期格式 —— 从厂商能力到分层防御</title>
+<meta name="description" content="json_object 只保证语法不保证 schema;真正的保证来自约束解码,但截断、拒答、值级错误它也管不了。一篇覆盖海内外厂商现状、约束解码原理、TypeScript 生态与生产可靠性工程的长文。">
+<meta property="og:type" content="article">
+<meta property="og:title" content="如何确保 LLM 返回的 JSON 严格符合预期格式">
+<meta property="og:description" content="json_object ≠ schema 保证;约束解码是机制级保证但有三个逃逸口;连厂商官方文档都要求应用层校验+重试+降级。">
+<meta property="og:url" content="https://amsonntagchow.github.io/notes/llm-structured-output.html">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="如何确保 LLM 返回的 JSON 严格符合预期格式">
+<meta name="twitter:description" content="json_object ≠ schema 保证;约束解码是机制级保证但有三个逃逸口;连厂商官方文档都要求应用层校验+重试+降级。">
+<link rel="canonical" href="https://amsonntagchow.github.io/notes/llm-structured-output.html">
+<style>
+  :root {
+    --bg: #F5F7F7;
+    --surface: #FFFFFF;
+    --surface2: #EDF1F0;
+    --ink: #17211F;
+    --ink2: #46554F;
+    --muted: #6E7E7A;
+    --line: #DCE3E1;
+    --accent: #0B7A65;
+    --accent-soft: #E2F0EC;
+    --warn: #9A5B0B;
+    --warn-soft: #F7EDDD;
+    --danger: #AE3A32;
+    --danger-soft: #F8E8E6;
+    --info: #2458A6;
+    --info-soft: #E5EDF8;
+    --code-bg: #EFF3F2;
+    --mono: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+    --sans: -apple-system, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0E1413;
+      --surface: #151C1B;
+      --surface2: #1B2422;
+      --ink: #E4EAE8;
+      --ink2: #B4C2BE;
+      --muted: #8CA09B;
+      --line: #263130;
+      --accent: #45C6A8;
+      --accent-soft: #12332C;
+      --warn: #E0A24A;
+      --warn-soft: #33280F;
+      --danger: #EF8078;
+      --danger-soft: #3A1B18;
+      --info: #82AEE8;
+      --info-soft: #16273E;
+      --code-bg: #1A2321;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0E1413; --surface: #151C1B; --surface2: #1B2422;
+    --ink: #E4EAE8; --ink2: #B4C2BE; --muted: #8CA09B; --line: #263130;
+    --accent: #45C6A8; --accent-soft: #12332C;
+    --warn: #E0A24A; --warn-soft: #33280F;
+    --danger: #EF8078; --danger-soft: #3A1B18;
+    --info: #82AEE8; --info-soft: #16273E;
+    --code-bg: #1A2321;
+  }
+  :root[data-theme="light"] {
+    --bg: #F5F7F7; --surface: #FFFFFF; --surface2: #EDF1F0;
+    --ink: #17211F; --ink2: #46554F; --muted: #6E7E7A; --line: #DCE3E1;
+    --accent: #0B7A65; --accent-soft: #E2F0EC;
+    --warn: #9A5B0B; --warn-soft: #F7EDDD;
+    --danger: #AE3A32; --danger-soft: #F8E8E6;
+    --info: #2458A6; --info-soft: #E5EDF8;
+    --code-bg: #EFF3F2;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); font-size: 15.5px; line-height: 1.85;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 48px 24px 96px; }
+  @media (max-width: 640px) { .wrap { padding: 32px 16px 64px; } }
+
+  /* ---------- header ---------- */
+  .eyebrow {
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--accent); margin-bottom: 14px;
+  }
+  h1 {
+    font-size: 30px; line-height: 1.35; font-weight: 700; margin: 0 0 10px;
+    letter-spacing: .01em; text-wrap: balance;
+  }
+  .subtitle { color: var(--ink2); font-size: 16px; margin: 0 0 20px; max-width: 42em; }
+  .meta {
+    display: flex; flex-wrap: wrap; gap: 8px 18px; font-family: var(--mono);
+    font-size: 12px; color: var(--muted); padding: 14px 0;
+    border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+  }
+  .meta b { color: var(--ink2); font-weight: 600; }
+
+  /* ---------- toc ---------- */
+  nav.toc {
+    margin: 28px 0 8px; padding: 18px 22px; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 10px;
+    columns: 2; column-gap: 32px; font-size: 14px;
+  }
+  @media (max-width: 640px) { nav.toc { columns: 1; } }
+  nav.toc a { display: block; color: var(--ink2); text-decoration: none; padding: 3px 0; break-inside: avoid; }
+  nav.toc a:hover { color: var(--accent); }
+  nav.toc .n { font-family: var(--mono); font-size: 11px; color: var(--accent); margin-right: 8px; }
+
+  /* ---------- sections ---------- */
+  section { margin-top: 56px; }
+  h2 {
+    font-size: 21px; font-weight: 700; margin: 0 0 6px; letter-spacing: .01em;
+    text-wrap: balance; scroll-margin-top: 24px;
+  }
+  h2 .n { font-family: var(--mono); font-size: 13px; color: var(--accent); margin-right: 10px; }
+  .lede { color: var(--ink2); margin: 0 0 18px; max-width: 46em; }
+  h3 { font-size: 16.5px; font-weight: 650; margin: 28px 0 8px; }
+  p { margin: 10px 0; max-width: 46em; }
+  ul, ol { margin: 10px 0; padding-left: 1.4em; max-width: 44em; }
+  li { margin: 6px 0; }
+  li::marker { color: var(--accent); }
+  strong { font-weight: 650; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+
+  code {
+    font-family: var(--mono); font-size: .86em; background: var(--code-bg);
+    padding: 2px 6px; border-radius: 5px; color: var(--ink);
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px; overflow-x: auto; font-size: 13px; line-height: 1.7;
+    margin: 16px 0;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  .cm { color: var(--muted); }
+  .kw { color: var(--info); }
+  .st { color: var(--accent); }
+
+  /* ---------- chips / badges ---------- */
+  .chip {
+    display: inline-block; font-family: var(--mono); font-size: 11px;
+    padding: 1.5px 8px; border-radius: 99px; vertical-align: 2px;
+    letter-spacing: .02em; white-space: nowrap;
+  }
+  .chip.ok   { background: var(--accent-soft); color: var(--accent); }
+  .chip.warn { background: var(--warn-soft); color: var(--warn); }
+  .chip.bad  { background: var(--danger-soft); color: var(--danger); }
+  .chip.info { background: var(--info-soft); color: var(--info); }
+
+  /* ---------- callouts ---------- */
+  .callout {
+    border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    background: var(--surface); border-radius: 8px; padding: 14px 18px; margin: 18px 0;
+    font-size: 14.5px;
+  }
+  .callout.danger { border-left-color: var(--danger); }
+  .callout.warn { border-left-color: var(--warn); }
+  .callout.info { border-left-color: var(--info); }
+  .callout .tag {
+    display: block; font-family: var(--mono); font-size: 11px; letter-spacing: .1em;
+    text-transform: uppercase; margin-bottom: 6px; color: var(--accent);
+  }
+  .callout.danger .tag { color: var(--danger); }
+  .callout.warn .tag { color: var(--warn); }
+  .callout.info .tag { color: var(--info); }
+  .callout p { margin: 6px 0; }
+
+  /* ---------- tables ---------- */
+  .tablewrap { overflow-x: auto; margin: 18px 0; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; line-height: 1.65; }
+  th {
+    text-align: left; font-weight: 650; font-size: 12.5px; color: var(--ink2);
+    background: var(--surface2); padding: 10px 14px; white-space: nowrap;
+    border-bottom: 1px solid var(--line);
+  }
+  td { padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; min-width: 120px; }
+  tr:last-child td { border-bottom: none; }
+  td.na { color: var(--muted); }
+  .num { font-variant-numeric: tabular-nums; font-family: var(--mono); font-size: .92em; }
+
+  /* ---------- defense layer diagram ---------- */
+  .layers { display: flex; flex-direction: column; gap: 0; margin: 22px 0; }
+  .layer {
+    display: grid; grid-template-columns: 92px 1fr; gap: 16px;
+    background: var(--surface); border: 1px solid var(--line);
+    padding: 14px 18px;
+  }
+  .layer:first-child { border-radius: 10px 10px 0 0; }
+  .layer + .layer { border-top: none; }
+  .layer.obs { border-radius: 0 0 10px 10px; background: var(--surface2); }
+  .layer .lid {
+    font-family: var(--mono); font-size: 12px; color: var(--accent); font-weight: 600;
+    padding-top: 2px; white-space: nowrap;
+  }
+  .layer .lbody { font-size: 14px; }
+  .layer .lbody b { display: block; font-size: 14.5px; margin-bottom: 2px; }
+  .layer .lbody span { color: var(--ink2); }
+  .layer .catch { display: block; margin-top: 4px; font-size: 12.5px; color: var(--muted); }
+  .catch em { font-style: normal; color: var(--warn); }
+  @media (max-width: 560px) { .layer { grid-template-columns: 1fr; gap: 4px; } }
+
+  /* ---------- source list ---------- */
+  .sources { font-size: 13px; color: var(--ink2); }
+  .sources li { margin: 4px 0; word-break: break-all; }
+
+  .footer {
+    margin-top: 72px; padding-top: 18px; border-top: 1px solid var(--line);
+    font-size: 12.5px; color: var(--muted); font-family: var(--mono);
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <div class="eyebrow">工程笔记 · 2026-07-07</div>
+  <h1>如何确保 LLM 返回的 JSON 严格符合预期格式</h1>
+  <p class="subtitle">把 LLM 接进生产系统的人,迟早会在深夜遇到同一个报错:<code>JSON.parse</code> 炸了。模型昨天还乖乖返回结构化数据,今天突然多包了一层 markdown 围栏、少了一个闭括号,或者干脆用散文向你道歉。这篇文章系统梳理了这个问题的全部已知解法——各家厂商的原生能力(海外与国内)、约束解码的原理与边界、TypeScript 生态的应用层方案、修复策略与生产可靠性工程——最后给出一套可以直接抄的「分层防御」架构。</p>
+  <div class="meta">
+    <span>文中所有厂商能力结论,均核验自 <b>2026-07-07 当日抓取的各厂商现行官方文档</b>,并已剔除第三方 SEO 站的不实宣称。</span>
+  </div>
+
+  <nav class="toc">
+    <a href="#s1"><span class="n">01</span>核心结论</a>
+    <a href="#s2"><span class="n">02</span>三档保证强度与约束解码原理</a>
+    <a href="#s3"><span class="n">03</span>厂商能力对比(海外 + 国内)</a>
+    <a href="#s4"><span class="n">04</span>strict 模式也逃不掉的残余失败</a>
+    <a href="#s5"><span class="n">05</span>自托管约束解码</a>
+    <a href="#s6"><span class="n">06</span>TypeScript 应用层生态</a>
+    <a href="#s7"><span class="n">07</span>解析与修复策略</a>
+    <a href="#s8"><span class="n">08</span>Prompt 层技巧</a>
+    <a href="#s9"><span class="n">09</span>生产可靠性工程</a>
+    <a href="#s10"><span class="n">10</span>前沿与争论</a>
+    <a href="#s11"><span class="n">11</span>分层防御参考架构</a>
+    <a href="#s13"><span class="n">12</span>主要来源</a>
+  </nav>
+
+  <!-- ================================================================ -->
+  <section id="s1">
+    <h2><span class="n">01</span>核心结论</h2>
+    <ul>
+      <li><strong>JSON mode ≠ schema 保证。</strong><code>response_format: json_object</code> 在所有厂商语义下都只保证「输出是语法合法的 JSON」,完全不保证符合任何 schema。OpenAI 官方原话:「尽可能始终使用 Structured Outputs 而非 JSON mode」。</li>
+      <li><strong>真正的机制级保证来自约束解码(constrained decoding)。</strong>把 JSON Schema 编译成文法,采样时逐 token 掩掉非法 token——OpenAI Structured Outputs、Anthropic structured outputs、Gemini responseSchema、火山方舟 json_schema strict 均属此类。纯 prompt 引导在 OpenAI 内部评测中只有 &lt;40% 合规率,纯训练改进 93%,加约束解码才到 100%(仅指结构合法)。</li>
+      <li><strong>即使最强 strict 模式也有三类残余失败:</strong>max_tokens 截断、安全拒答(拒答文本优先于 schema)、结构合法但字段值语义错误。「开了 strict 就不用校验和重试」这个流传很广的说法,拿四家厂商的文档逐条对照就站不住脚(§04 有细账)。</li>
+      <li><strong>应用层校验 + 重试 + 降级不是社区经验,是厂商处方。</strong>阿里云、智谱、方舟的官方文档都明文要求:输出传给下游前必须做 schema 校验,失败则重试或换模型修复,并准备简化版备用 schema。</li>
+      <li><strong>国内厂商分化明显:</strong>火山方舟已支持 <code>json_schema + strict:true</code>(beta,官方推荐但提示生产慎用);DeepSeek、通义千问、智谱 GLM 的官方 API 至今只有 json_object,schema 只能写进 prompt,遵从靠模型自觉。</li>
+      <li><strong>结论:没有任何单层可以单独信任。</strong>业务级稳定 = 请求层约束(能开 strict 就开)× 响应门禁(截断/空内容检测 + Zod 校验)× 恢复层(修复 → 带错误重试 → 降级)× 观测层(失败率指标 + 告警)。</li>
+    </ul>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="s2">
+    <h2><span class="n">02</span>三档保证强度与约束解码原理</h2>
+    <p class="lede">市面上所有做法按「保证从哪来」分成三档,强度差异是机制性的,不是程度性的。</p>
+
+    <div class="tablewrap"><table>
+      <tr><th>档位</th><th>机制</th><th>保证内容</th><th>典型形态</th></tr>
+      <tr>
+        <td><strong>① Prompt 引导</strong></td>
+        <td>把 schema/示例写进提示词,靠模型自觉</td>
+        <td>无保证。OpenAI 内部评测 gpt-4-0613 仅 &lt;40% 合规</td>
+        <td>schema-in-prompt、few-shot、prefill</td>
+      </tr>
+      <tr>
+        <td><strong>② JSON mode</strong></td>
+        <td>约束输出为合法 JSON 语法,不看 schema</td>
+        <td>仅语法合法;截断时连这条也失效</td>
+        <td><code>json_object</code>(DeepSeek/Qwen/GLM 仅有此档)</td>
+      </tr>
+      <tr>
+        <td><strong>③ 约束解码</strong></td>
+        <td>schema 编译为文法,逐 token 掩码非法 token</td>
+        <td>结构 100% 合规(截断/拒答除外);<strong>值的语义不保证</strong></td>
+        <td>OpenAI/Anthropic/Gemini/方舟 strict、自托管 XGrammar 等</td>
+      </tr>
+    </table></div>
+
+    <h3>约束解码怎么工作</h3>
+    <p>OpenAI 的公开描述:把提交的 JSON Schema 转换成<strong>上下文无关文法(CFG)</strong>,推理时每一步用文法计算「当前位置合法的 token 集合」,把非法 token 的采样概率置 0。选 CFG 而不是正则/FSM 的原因是 FSM 无法表达递归结构(深层嵌套的括号匹配),CFG 可以支持 <code>$ref: #</code> 递归 schema。OpenAI 官方致谢了 outlines、jsonformer、instructor、guidance、lark 等开源项目作为灵感来源。</p>
+    <p>工程代价是<strong>首次编译延迟</strong>:新 schema 第一次请求要预处理(OpenAI 2024 年数字:典型 schema 10 秒内,复杂 schema 最长 1 分钟),之后缓存复用零额外延迟。Anthropic 的文法编译产物自最后使用起缓存 24 小时,schema 结构或请求内工具集一变缓存即失效——这意味着 <strong>schema 版本化要克制,频繁变更 schema 等于持续吃首编译延迟</strong>。</p>
+
+    <div class="callout info">
+      <span class="tag">关键数字</span>
+      <p>OpenAI 复杂 schema 遵循内部评测:纯 prompt(gpt-4-0613)<b>&lt;40%</b> → 纯训练改进(gpt-4o-2024-08-06)<b>93%</b> → 同模型 + 约束解码 <b>100%</b>。OpenAI 自己的评价:93%「仍不满足开发者构建健壮应用所需的可靠性」。注意 100% 仅指结构合法,不含值正确性;该数字出自厂商发布博客,置信度标为 medium。</p>
+    </div>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="s3">
+    <h2><span class="n">03</span>厂商能力对比</h2>
+    <p class="lede">全部结论基于 2026-07-07 实时抓取的厂商一手文档,每条经 3 票对抗验证。国内厂商的第三方站(SEO 中转页/API 分销商)宣称的能力一律以官方文档为准核实过。</p>
+
+    <div class="tablewrap"><table>
+      <tr><th>厂商 / 接口</th><th>schema 级强制</th><th>可用模式</th><th>关键限制与坑</th></tr>
+      <tr>
+        <td><strong>OpenAI</strong></td>
+        <td><span class="chip ok">支持</span></td>
+        <td><code>json_schema</code> strict(2024-08 GA)+ 旧 json_object</td>
+        <td>仅支持 JSON Schema 子集(全字段 required、<code>additionalProperties:false</code> 等);strict 与并行函数调用有兼容性限制(建议 <code>parallel_tool_calls:false</code>);首请求编译延迟</td>
+      </tr>
+      <tr>
+        <td><strong>Anthropic</strong></td>
+        <td><span class="chip ok">支持(GA)</span></td>
+        <td><code>output_config.format</code>(JSON outputs)+ strict tool use(<code>strict:true</code>),可独立或组合用</td>
+        <td>不支持:递归 schema、min/max、minLength/maxLength、正则反向引用/前瞻;上限 20 个 strict 工具、24 个可选参数、16 个 anyOf,超限 400;SDK 会自动剥离不支持的约束改为客户端校验(意味着数值/长度约束并不受文法强制);文法缓存 24h</td>
+      </tr>
+      <tr>
+        <td><strong>Google Gemini</strong></td>
+        <td><span class="chip ok">支持</span></td>
+        <td><code>responseSchema</code>(Gemini 3 系为 <code>responseJsonSchema</code>);支持流式结构化输出</td>
+        <td><strong>不支持的 schema 关键字被静默忽略</strong>(对比其他家显式 400,是独有陷阱);复杂/深嵌套 schema 可能 400;官方明文要求应用侧校验值:「schema-compliant but semantically incorrect」被列为常态失败模式</td>
+      </tr>
+      <tr>
+        <td><strong>火山方舟(豆包)</strong></td>
+        <td><span class="chip warn">支持,beta</span></td>
+        <td><code>json_schema + strict:true</code>(官方定位为 json_object 的演进版并明确推荐)+ json_object</td>
+        <td>官方原话「受资源与平台负载影响,服务可用性可能随访问情况产生波动,请谨慎在生产环境使用」;不承诺 100% 正确;仅限文档列出的模型;Responses API 下参数名是 <code>text.format</code>;<strong>文档自己推荐用 Zod/Pydantic 做客户端校验</strong></td>
+      </tr>
+      <tr>
+        <td><strong>DeepSeek</strong></td>
+        <td><span class="chip bad">无</span></td>
+        <td>仅 <code>json_object</code>(API 枚举只有 text / json_object)</td>
+        <td>prompt 必须含 "json" 一词并给出格式示例;<strong>官方自曝已知问题:可能偶发返回空内容</strong>,缓解手段仅为改 prompt → 空内容检测 + 重试必须自备;变通:beta 的 strict tool calling 可强制函数入参 schema</td>
+      </tr>
+      <tr>
+        <td><strong>阿里云百炼(通义)</strong></td>
+        <td><span class="chip bad">无</span></td>
+        <td>仅 <code>json_object</code>(5 个官方页面 grep json_schema 零命中)</td>
+        <td>System/User 消息里必须出现 "JSON" 关键词,否则直接 400(有生产事故佐证);官方生产指南点名 Ajv 校验 + 失败重试/换模型修复;开源 Qwen 权重在 vLLM 等宿主上可获文法级约束(宿主能力,非平台能力)</td>
+      </tr>
+      <tr>
+        <td><strong>智谱 GLM(Z.AI / bigmodel)</strong></td>
+        <td><span class="chip bad">无</span></td>
+        <td>仅 <code>json_object</code>(API 将 response_format 封闭枚举为两值)</td>
+        <td>schema 须写进 system prompt;<strong>官方文档自己开出多层防御处方</strong>:「多层验证:Schema 验证 + 业务逻辑验证」「准备简化的备用 Schema」「详细记录错误信息」,官方示例同时 catch JSONDecodeError 和 ValidationError</td>
+      </tr>
+    </table></div>
+
+    <div class="callout">
+      <span class="tag">值得玩味</span>
+      <p>只有 json_object 的三家国内厂商(DeepSeek/通义/智谱),官方文档反而写得最像「防御性工程指南」——等于厂商以文档形式承认:json_object 的输出不能直接信任。这也是为什么应用层防御无论对接哪家都不能省。</p>
+    </div>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="s4">
+    <h2><span class="n">04</span>strict 模式也逃不掉的残余失败</h2>
+    <p class="lede">这是跨 OpenAI / Anthropic / Google / 方舟四家一致的结论,四家文档都给出了对应的检测手段——意味着这些分支在任何厂商下都必须写。</p>
+
+    <div class="tablewrap"><table>
+      <tr><th>失败模式</th><th>表现</th><th>检测方法</th></tr>
+      <tr>
+        <td><strong>max_tokens 截断</strong></td>
+        <td>输出是不完整、违反 schema 的 JSON(连 JSON mode 的语法保证也一并失效)</td>
+        <td>OpenAI:<code>finish_reason === "length"</code>(Responses API 为 status <code>incomplete</code>);Anthropic:<code>stop_reason === "max_tokens"</code></td>
+      </tr>
+      <tr>
+        <td><strong>安全拒答</strong></td>
+        <td>拒答文本优先于 schema 约束;仍返回 200 且照常计费</td>
+        <td>OpenAI:独立的 <code>refusal</code> 字段;Anthropic:<code>stop_reason === "refusal"</code></td>
+      </tr>
+      <tr>
+        <td><strong>值级 / 语义错误</strong></td>
+        <td>结构完全合法,但字段内容是错的(约束解码原理上无法防止)</td>
+        <td>业务规则校验(Zod <code>refine</code>)、下游一致性检查、evals</td>
+      </tr>
+      <tr>
+        <td><strong>schema 不被支持</strong></td>
+        <td>用了厂商子集之外的关键字:或显式 400(OpenAI/Anthropic/方舟),或被静默忽略(Gemini)</td>
+        <td>上线前对照厂商 schema 支持清单;Gemini 需专门测试约束是否真的生效</td>
+      </tr>
+      <tr>
+        <td><strong>beta 可用性波动</strong></td>
+        <td>方舟 json_schema 官方明示可用性随负载波动</td>
+        <td>保留 json_object 降级开关,灰度上线</td>
+      </tr>
+    </table></div>
+
+    <div class="callout danger">
+      <span class="tag">一个流传很广但站不住的说法</span>
+      <p>「OpenAI Structured Outputs 保证输出符合 schema,因此<b>不再需要校验和重试循环</b>」——把它和四家厂商文档逐条对照就会发现:strict 只消灭了「schema 违规」这一类失败,截断、拒答、值级错误仍需应用层兜底,OpenAI 自己的文档甚至给出了 <code>finish_reason</code> 和 <code>refusal</code> 的官方处理代码。任何「开了 strict 就可以裸 parse」的架构,都建立在一个厂商自己都不认的前提上。</p>
+    </div>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="s5">
+    <h2><span class="n">05</span>自托管约束解码</h2>
+    <p class="lede">自己部署开源模型时,schema 强制能力来自推理框架而非模型。这条路能把 json_object-only 的开源权重(Qwen、GLM、DeepSeek 蒸馏系)升级成文法级强制。</p>
+    <ul>
+      <li><strong>Outlines(dottxt)</strong>:FSM/正则路线的开创者,OpenAI 官方致谢的灵感来源之一;Python 生态,也是「约束解码不损害质量」论战的主要反方(见 §10)。</li>
+      <li><strong>XGrammar</strong>:字节级下推自动机;核心优化是把词表拆成「上下文无关 token(可预计算)」和「上下文相关 token(运行时检查)」——Llama-3.1 的 128k 词表配 JSON 文法时后者只有 1134 个(&lt;1%),因此自适应掩码缓存能消掉绝大部分开销。宣称掩码延迟较此前方案降低最高 100 倍,H100 上端到端最高 80 倍加速。已集成进主流开源推理栈。</li>
+      <li><strong>LLGuidance</strong>:免预编译,适合动态/复杂 schema(复杂 schema 下 XGrammar 会超时而 LLGuidance 零超时)。</li>
+      <li><strong>vLLM / SGLang</strong>:vLLM 已在 v0.12.0 移除弃用的 <code>guided_json</code>,现行参数是 <code>structured_outputs</code>;v0.10 时代 batch ≥ 8 开启约束解码有显著性能衰减,而 SGLang 把 CPU 端掩码生成与 GPU 推理重叠执行几乎隐藏了开销——<strong>框架集成方式是自托管选型的决定性因素</strong>。</li>
+      <li><strong>llama.cpp GBNF</strong>:本地小模型的文法约束方案,手写 BNF 文法。</li>
+    </ul>
+    <div class="callout warn">
+      <span class="tag">自托管也不是零失败</span>
+      <p>基准数据两面都要看:重复性 schema(book-info)上,无约束最高只有 <b>72%</b> 结构正确率,开 XGrammar / LLGuidance 后都到 <b>100%</b>;但动态 schema 测试(github_easy)里 XGrammar 仍产出 <b>2.21%</b> 非法 JSON、LLGuidance <b>0.12%</b>。选型经验:重复固定 schema → XGrammar(吃文法缓存红利);动态复杂 schema → LLGuidance。无论哪个,业务层解析校验兜底不能拆。</p>
+    </div>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="s6">
+    <h2><span class="n">06</span>TypeScript 应用层生态</h2>
+    <p class="lede">四个代表性方案,各自代表一种思路:SDK 抽象、重试循环、容错解析、类型即 schema。</p>
+
+    <h3>Vercel AI SDK —— SDK 抽象层</h3>
+    <ul>
+      <li>开发者给 Zod / Valibot / JSON Schema,SDK 同时用它<strong>引导生成 + 生成后校验</strong>,返回类型安全对象;现行推荐 API 是 <code>generateText/streamText</code> 上的 <code>output</code> 属性(<code>Output.object/array/choice/json</code>),抽象掉各厂商的结构化输出差异(generateObject 已不再是文档主推)。</li>
+      <li>失败抛 <code>AI_NoObjectGeneratedError</code>,附带原始文本、响应元数据、token 用量与底层原因——是现成的监控埋点。</li>
+      <li><strong>流式陷阱:</strong>流式模式下中途吐出的 partial object <em>不做</em> schema 校验,只有最终完整对象有保证;数组的 <code>elementStream</code> 例外——每个元素完整后单独校验。</li>
+    </ul>
+
+    <h3>Instructor-JS —— 带错误反馈的重试循环</h3>
+    <ul>
+      <li>把 Zod schema 作为 <code>response_model</code> 挂在 <code>chat.completions.create</code> 上,底层走 function calling(TOOLS 模式,默认推荐)而非裸 JSON prompt。</li>
+      <li>核心是 <code>max_retries</code>:校验失败时自动把 <strong>Zod 校验错误回填进下一次请求</strong>让模型改正,直到通过——包括 <code>refine</code> 自定义业务规则。这是「validate-then-retry-with-error-feedback」模式的标杆实现。</li>
+      <li>文档明确不推荐 MD_JSON(让模型在 markdown 里吐 JSON)这条路,称其不可靠、仅为视觉模型保留。</li>
+    </ul>
+
+    <h3>BAML(Schema-Aligned Parsing)—— 容错解析路线</h3>
+    <ul>
+      <li>思路反转:<strong>不约束模型,约束解析器</strong>。SAP 是一个 schema 感知的容错解析器(编辑距离式纠错 + schema 加权代价),直接修掉注释、未加引号的 key、尾逗号、未转义引号、包裹的废话文本、多余字段,还能补全 partial 对象以支持流式。Postel 定律:「对接收的内容宽容」。</li>
+      <li>Berkeley Function Calling Leaderboard(每模型 n=1000):SAP 在多数模型上 &gt;90%,普遍打败原生 function calling——最悬殊的 gpt-4o-mini:FC 19.8% vs SAP 92.4%(claude-3-haiku 57.3→91.7,gpt-4o 87.4→93)。</li>
+      <li>BAML 的实战观察:厂商 JSON mode 在较大数据集上 schema 级错误率经常超过 10%——「structured outputs 造成虚假安全感」。</li>
+    </ul>
+
+    <h3>TypeChat(微软)—— 类型即 schema 的先驱</h3>
+    <p>用 TypeScript 类型定义充当 schema,校验失败后携带类型错误自动修复重试。工程上已被上面几家超越,但「以类型系统为契约 + 校验修复循环」的范式来自这里。</p>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="s7">
+    <h2><span class="n">07</span>解析与修复策略</h2>
+    <p class="lede">在重新调用模型(贵、慢)之前,确定性修复(快、免费)应该先上。</p>
+    <ul>
+      <li><strong>围栏剥离:</strong>模型爱用 <code>```json ... ```</code> 包裹输出,parse 前先剥;更稳的写法是取第一个 <code>{</code> 到最后一个 <code>}</code> 的切片。</li>
+      <li><strong>jsonrepair:</strong>确定性修复 LLM 输出最典型的坏 JSON——截断、markdown 围栏、缺引号/逗号/闭括号、单引号、Python 常量(None/True/False)——<strong>不需要再调一次模型</strong>。失败契约干净:要么返回修好的 JSON,要么抛类型化的 <code>JSONRepairError</code>,可直接接 fallback 分支。有流式变体 <code>jsonrepairTransform</code>(默认 64KB 缓冲;单个超长字符串会触发 Index out of range,长文本字段要调大缓冲)。</li>
+      <li><strong>partial-json 解析:</strong>流式 UI 场景下对未闭合的 JSON 做尽力解析,配合「partial 不校验、完整才校验」的纪律使用(见 Vercel AI SDK 的流式陷阱)。</li>
+      <li><strong>截断的根治是预算,不是修复:</strong><code>max_tokens</code> 要给输出 schema 的最坏情况留出余量;修复截断 JSON 只该是最后的补救,<code>finish_reason</code> 检测 + 合理预算才是正解。</li>
+    </ul>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="s8">
+    <h2><span class="n">08</span>Prompt 层技巧</h2>
+    <p class="lede">用了 strict 也别删这一层:它决定「值」的质量,而且是向 json_object-only 厂商迁移时的可移植性保障。</p>
+    <ul>
+      <li><strong>"json" 关键词是硬约束不是玄学:</strong>DeepSeek 和阿里云百炼都要求 System/User 消息中必须出现 "json" 字样——百炼缺了直接 400(<code>messages must contain the word json in some form</code>)。写 prompt 模板时把这当成 API 契约。</li>
+      <li><strong>schema + 一个具体示例:</strong>DeepSeek 官方要求提供期望 JSON 的示例;示例比 schema 描述更能压住格式漂移,特别是对弱模型。</li>
+      <li><strong>Assistant prefill:</strong>把 assistant 回合以 <code>{</code> 开头预填,模型被迫从 JSON 内部续写,天然消掉开场废话(Anthropic 经典技巧;注意 Anthropic 上 prefill 与其结构化输出功能不兼容,二选一)。</li>
+      <li><strong>字段顺序即思维链:</strong>生成是顺序的——把 <code>reasoning</code> 字段放在结论字段之前,等于强制先想后答;反过来把答案放前面,推理字段就成了事后编造。</li>
+      <li><strong>停止序列:</strong>非 JSON-mode 场景下可用 stop sequence 截掉 JSON 之后的赘述。</li>
+      <li><strong>别用 markdown-JSON:</strong>「请在代码块里返回 JSON」是 Instructor 文档明确不推荐的模式,解析面最脆。</li>
+    </ul>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="s9">
+    <h2><span class="n">09</span>生产可靠性工程</h2>
+
+    <h3>恢复阶梯(便宜的先上)</h3>
+    <ol>
+      <li><strong>确定性修复:</strong>围栏剥离 → <code>jsonrepair</code> → 再 parse。零成本零延迟。</li>
+      <li><strong>原样重试:</strong>相同请求 + 指数退避加抖动(参考实现:最多 3 次)。很多失败是瞬时的,第二次就好了。</li>
+      <li><strong>纠错重试:</strong>把失败输出和<strong>精确的解析器/Zod 错误信息</strong>回填进下一次请求,重申 schema,让模型改错(Instructor 模式)。有限次数,通常 1-2 次。</li>
+      <li><strong>降级:</strong>换简化版备用 schema(智谱官方处方)/ 换一个模型修复输出(阿里云官方处方)。</li>
+      <li><strong>业务兜底:</strong>上一次的好结果(缓存)、默认内容、或功能静默隐藏——绝不把 500 甩给用户。</li>
+    </ol>
+
+    <h3>观测</h3>
+    <ul>
+      <li>按端点 × schema 版本记录:<strong>解析失败率、截断率(finish_reason=length 占比)、空内容率、重试率、最终降级率</strong>,失败率突变告警。</li>
+      <li>失败时必须留存<strong>原始输出</strong>(否则无法归因是模型漂移还是 schema 变更)。</li>
+      <li>evals 有个隐蔽坑:测「非结构化输出的准确率」时结果对解析器高度敏感——同一批输出,手写宽松正则解析 61% vs AI 解析器 57%。回归测试要固定解析器。</li>
+    </ul>
+
+    <h3>参数与版本</h3>
+    <ul>
+      <li>提取/分类类任务用低 temperature;需要文采的生成任务别为了格式牺牲温度——格式交给约束/校验层管。</li>
+      <li>schema 版本号进缓存 key 和监控维度(schema 一变,厂商侧文法编译缓存即失效,首请求有编译延迟——发版时预热一次)。</li>
+      <li>模型升级 = schema 遵从行为可能变,切模型前跑固定用例回归。</li>
+    </ul>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="s10">
+    <h2><span class="n">10</span>前沿与争论</h2>
+    <ul>
+      <li><strong>「约束税」论战:</strong>arXiv 2408.02442(Let Me Speak Freely?)称格式约束损害推理能力,流传很广;dottxt 的反驳《Say What You Mean》用对照实验证明:prompt 写得当时,约束解码不弱于甚至优于自由生成。目前的工程共识是两阶段化解:<strong>先自由推理、再结构化提取</strong>,或用字段顺序把推理装进 schema 内部(§08)。</li>
+      <li><strong>解析器路线 vs 约束路线:</strong>BAML 的 SAP 证明「宽容解析器 + 事后校验」在准确率上能打平甚至超过约束解码,且不依赖厂商能力、模型无关——对多供应商/国产模型混布的业务是重要备选。</li>
+      <li><strong>双模型/自修复:</strong>「生成模型 + 廉价小模型做校验修复」已从民间技巧升格为厂商官方建议(阿里云:「使用另一个模型修复输出」)。语义级校验(LLM-as-judge 抽查值的正确性)是 schema 校验之上的下一层,用于对抗「结构对但内容错」。</li>
+      <li><strong>趋势判断:</strong>约束解码正在从差异化能力变成基础设施(XGrammar 进主流推理栈、各厂商陆续原生支持);应用层的差异化会转移到值级校验、evals 与观测。</li>
+    </ul>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="s11">
+    <h2><span class="n">11</span>分层防御参考架构</h2>
+    <p class="lede">每一层只兜住上一层明确漏掉的失败模式;去掉任何一层,该层对应的失败就直达用户。</p>
+
+    <div class="layers">
+      <div class="layer">
+        <div class="lid">L0 提示层</div>
+        <div class="lbody">
+          <b>schema + 示例写进 prompt,含 "json" 关键词</b>
+          <span>字段顺序安排推理在前、结论在后;低温用于提取类任务。</span>
+          <em class="catch">兜住:<em>值质量、跨厂商可移植性</em>(DeepSeek/Qwen/GLM 只有这层可用)</em>
+        </div>
+      </div>
+      <div class="layer">
+        <div class="lid">L1 请求层</div>
+        <div class="lbody">
+          <b>能开约束解码就开:json_schema + strict:true</b>
+          <span>对照厂商 schema 子集清单设计 schema;max_tokens 按最坏情况留余量;beta 能力配降级开关灰度。</span>
+          <em class="catch">兜住:<em>结构违规</em>(从「大概率对」变「机制保证」)</em>
+        </div>
+      </div>
+      <div class="layer">
+        <div class="lid">L2 门禁层</div>
+        <div class="lbody">
+          <b>parse 前查 finish_reason / 空内容,parse 后必过 Zod safeParse</b>
+          <span>业务规则用 refine 挂在同一个 schema 上;partial 流式对象不校验、完整才校验。</span>
+          <em class="catch">兜住:<em>截断、拒答、空内容、值级错误</em>(strict 模式明确不管的全部)</em>
+        </div>
+      </div>
+      <div class="layer">
+        <div class="lid">L3 恢复层</div>
+        <div class="lbody">
+          <b>修复 → 原样重试 → 带错误反馈重试 → 降级 → 业务兜底</b>
+          <span>确定性修复(jsonrepair)最先;纠错重试限 1-2 次;备好简化 schema 或备用模型;最终兜底是缓存/默认值,不是 500。</span>
+          <em class="catch">兜住:<em>瞬时失败、顽固格式漂移、厂商可用性波动</em></em>
+        </div>
+      </div>
+      <div class="layer obs">
+        <div class="lid">L4 观测层</div>
+        <div class="lbody">
+          <b>失败率 / 截断率 / 重试率 / 降级率,按端点 × schema 版本打点 + 告警</b>
+          <span>失败留存原始输出;schema 版本化;换模型先跑固定用例回归。横跨 L0–L3,是其余四层有效性的唯一证明。</span>
+        </div>
+      </div>
+    </div>
+
+    <h3>最小实现骨架(Bun / TypeScript)</h3>
+    <pre><code><span class="kw">async function</span> callStructured&lt;T&gt;(schema: z.ZodType&lt;T&gt;, body: ChatBody): Promise&lt;T&gt; {
+  <span class="kw">for</span> (<span class="kw">let</span> attempt = 0; attempt &lt;= MAX_RETRY; attempt++) {
+    <span class="kw">const</span> res  = <span class="kw">await</span> chat(body);                          <span class="cm">// L1: json_schema strict(方舟 beta,失败自动回落 json_object)</span>
+    <span class="kw">const</span> choice = res.choices?.[0];
+    <span class="kw">if</span> (choice?.finish_reason === <span class="st">"length"</span>) { metric(<span class="st">"llm_truncated"</span>); <span class="kw">continue</span>; }   <span class="cm">// L2: 截断门禁</span>
+    <span class="kw">const</span> raw = choice?.message?.content ?? <span class="st">""</span>;
+    <span class="kw">if</span> (!raw.trim()) { metric(<span class="st">"llm_empty"</span>); <span class="kw">continue</span>; }                              <span class="cm">// L2: 空内容(DeepSeek 已知问题)</span>
+
+    <span class="kw">let</span> parsed: unknown;
+    <span class="kw">try</span> { parsed = JSON.parse(stripFences(raw)); }
+    <span class="kw">catch</span> { <span class="kw">try</span> { parsed = JSON.parse(jsonrepair(raw)); }                            <span class="cm">// L3: 确定性修复</span>
+            <span class="kw">catch</span> { metric(<span class="st">"llm_unparseable"</span>, { raw }); <span class="kw">continue</span>; } }
+
+    <span class="kw">const</span> v = schema.safeParse(parsed);                                              <span class="cm">// L2: schema + refine 业务规则</span>
+    <span class="kw">if</span> (v.success) <span class="kw">return</span> v.data;
+    body = withErrorFeedback(body, raw, v.error);                                    <span class="cm">// L3: 纠错重试(Instructor 模式)</span>
+    metric(<span class="st">"llm_schema_fail"</span>, { issues: v.error.issues });
+  }
+  <span class="kw">throw new</span> StructuredOutputError();                                                <span class="cm">// 调用方接 L3 兜底:缓存 last-good / 降级隐藏</span>
+}</code></pre>
+  </section>
+
+  <!-- ================================================================ -->
+  <section id="s13">
+    <h2><span class="n">12</span>主要来源</h2>
+    <ul class="sources">
+      <li>OpenAI — Structured Outputs 指南 · developers.openai.com/api/docs/guides/structured-outputs;发布博客 · openai.com/index/introducing-structured-outputs-in-the-api</li>
+      <li>Anthropic — Structured Outputs · platform.claude.com/docs/en/build-with-claude/structured-outputs</li>
+      <li>Google — Gemini Structured Output · ai.google.dev/gemini-api/docs/structured-output(2026-07-06 更新)</li>
+      <li>火山方舟 — 结构化输出(json_schema)· volcengine.com/docs/82379/1568221(2026-06-27 更新)、82379/1958523</li>
+      <li>DeepSeek — JSON Mode · api-docs.deepseek.com/guides/json_mode;Chat API 参考</li>
+      <li>阿里云百炼 — Qwen 结构化输出 · help.aliyun.com/zh/model-studio/qwen-structured-output;DashScope API 参考</li>
+      <li>智谱 — 结构化输出 · docs.z.ai/guides/capabilities/struct-output、docs.bigmodel.cn/cn/guide/capabilities/struct-output</li>
+      <li>XGrammar 论文/博客、LLGuidance 基准、vLLM v0.12 release notes、SGLang 文档</li>
+      <li>BAML — Schema-Aligned Parsing 与 BFCL 基准;Instructor-JS 文档;Vercel AI SDK 文档;jsonrepair(josdejong)</li>
+      <li>dottxt — “Say What You Mean”(对 arXiv 2408.02442 的反驳)</li>
+    </ul>
+    <p style="font-size:13px;color:var(--muted)">所有厂商能力结论均于 2026-07-07 对官方文档实时抓取验证;第三方宣称(如「DeepSeek/GLM 已支持 json_schema」的 SEO 站)已核实为不实或非官方能力。</p>
+  </section>
+
+  <div class="footer">Amos (@AmsonntagC) · 2026-07-07 · 转载注明出处</div>
+</div>
+</body>
+</html>
